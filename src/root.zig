@@ -8,6 +8,7 @@ pub const freq = @import("freq.zig");
 pub const list = @import("list.zig");
 pub const queue = @import("queue.zig");
 pub const lru = @import("lru.zig");
+pub const sort = @import("sort.zig");
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
