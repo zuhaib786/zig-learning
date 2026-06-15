@@ -220,7 +220,10 @@ pub fn handle_graph(args: *std.process.Args.Iterator, out: *std.Io.Writer, err: 
         try err.print("Source file path not provided\n", .{});
         return false;
     };
-    const file = std.Io.Dir.cwd().openFile(io, filename, .{}) catch |e| printOpenError(e, filename, e);
+    const file = std.Io.Dir.cwd().openFile(io, filename, .{}) catch |e| {
+        printOpenError(err, filename, e) catch {};
+        return false;
+    };
     defer file.close(io);
     var buf: [4098]u8 = undefined;
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -228,14 +231,66 @@ pub fn handle_graph(args: *std.process.Args.Iterator, out: *std.Io.Writer, err: 
     const allocator = arena.allocator();
     var filereader = file.reader(io, &buf);
     const reader = &filereader.interface;
-    const text = try reader.allocRemaining(arena, .unlimited);
+    const text = try reader.allocRemaining(allocator, .unlimited);
     var graph = try graphlib.parseGraph(allocator, text);
     switch (algo) {
-        .bfs => performBfs(&graph, out, err, io),
-        .dfs => performDfs(&graph, out, err, io),
-        .dijikstra => performDijikstra(&graph, out, err, io),
-        .topo => performTopo(&graph, out, err, io),
+        .bfs => try performBfs(&graph, args, out),
+        .dfs => try performDfs(&graph, args, out),
+        .dijikstra => try performDijikstra(&graph, args, out),
+        .topo => try performTopo(&graph, out, err),
     }
+    return true;
+}
+
+fn performBfs(graph: *graphlib.Graph, args: *std.process.Args.Iterator, out: *std.Io.Writer) !void {
+    const u: usize = try std.fmt.parseInt(usize, args.next() orelse "0", 10);
+    const order = try graph.bfs(u);
+    try out.print("Completed BFS order: ", .{});
+    for (order) |i| {
+        try out.print("{d} ", .{i});
+    }
+    try out.print("\n", .{});
+}
+fn performDfs(graph: *graphlib.Graph, args: *std.process.Args.Iterator, out: *std.Io.Writer) !void {
+    const u: usize = try std.fmt.parseInt(usize, args.next() orelse "0", 10);
+    const n = graph.adj.len;
+    var visited = try graph.allocator.alloc(bool, n);
+    for (0..n) |i| visited[i] = false;
+    graph.dfs(u, visited);
+    try out.print("Peformed DFS from {d}. Visited Nodes: ", .{u});
+    for (0..n) |i| {
+        if (visited[i]) try out.print("{d} ", .{i});
+    }
+    try out.print("\n", .{});
+}
+
+fn performDijikstra(graph: *graphlib.Graph, args: *std.process.Args.Iterator, out: *std.Io.Writer) !void {
+    const src: usize = try std.fmt.parseInt(usize, args.next() orelse "0", 10);
+    const distances = try graph.dijikstra(src);
+    const n = distances.len;
+    for (0..n) |i| {
+        if (distances[i] != graphlib.INF)
+            try out.print("{d}: {d}\n", .{ i, distances[i] })
+        else
+            try out.print("{d}: unreachable\n", .{i});
+    }
+}
+
+fn performTopo(graph: *graphlib.Graph, out: *std.Io.Writer, err: *std.Io.Writer) !void {
+    const ordering = graph.topologicalSort() catch |e| {
+        switch (e) {
+            error.CycleError => {
+                try err.print("Cycle detected\n", .{});
+                return;
+            },
+            else => return e,
+        }
+    };
+    try out.print("Topological Ordering is: ", .{});
+    for (ordering) |u| {
+        try out.print("{d} ", .{u});
+    }
+    try out.print("\n", .{});
 }
 pub fn countArgs(args: []const []const u8) CountResult {
     var count_result: CountResult = .{ .args = 0, .bytes = 0 };
@@ -305,7 +360,15 @@ test "add arg to count" {
 test "parse command" {
     try std.testing.expectEqual(Command.echo, parseCommand("echo").?);
     try std.testing.expectEqual(Command.count, parseCommand("count").?);
+    try std.testing.expectEqual(Command.graph, parseCommand("graph").?);
     try std.testing.expectEqual(null, parseCommand("nope"));
+}
+test "parse algo" {
+    try std.testing.expectEqual(GraphAlgo.bfs, parseAlgo("bfs").?);
+    try std.testing.expectEqual(GraphAlgo.dfs, parseAlgo("dfs").?);
+    try std.testing.expectEqual(GraphAlgo.topo, parseAlgo("topo").?);
+    try std.testing.expectEqual(GraphAlgo.dijikstra, parseAlgo("dijikstra").?);
+    try std.testing.expectEqual(null, parseAlgo("nope"));
 }
 test "text count" {
     var text: []const u8 = "";

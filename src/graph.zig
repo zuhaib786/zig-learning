@@ -4,7 +4,7 @@ const Allocator = std.mem.Allocator;
 const queue = @import("queue.zig");
 const heap = @import("heap.zig");
 const Heap = heap.MinHeap;
-const INF: u64 = 1e9 + 7;
+pub const INF: u64 = 1e9 + 7;
 
 pub const Graph = struct {
     const Self = @This();
@@ -137,7 +137,7 @@ pub fn parseGraph(allocator: Allocator, text: []const u8) !Graph {
     while (lines.next()) |line| {
         var tokens = std.mem.tokenizeAny(u8, line, "\r\t ");
         const u_s = tokens.next() orelse continue;
-        const v_s = tokens.next() orelse error.BadEdge;
+        const v_s = tokens.next() orelse return error.BadEdge;
         const u = try std.fmt.parseInt(usize, u_s, 10);
         const v = try std.fmt.parseInt(usize, v_s, 10);
         if (u >= n or v >= n) return error.NodeOutOfRange;
@@ -323,4 +323,43 @@ test "graph: dijkstra prefers the cheaper of two routes" {
     const dist = try g.dijikstra(0);
     defer a.free(dist);
     try expectEqualSlices(u64, &.{ 0, 1, 2, 3 }, dist);
+}
+
+test "graph: parse edge list (header + 'u v [w]' lines)" {
+    const a = testing.allocator;
+    const text =
+        \\4
+        \\0 1 5
+        \\0 2
+        \\
+        \\2 3 7
+    ;
+    var g = try parseGraph(a, text);
+    defer g.deinit();
+    try expectEqual(4, g.adj.len);
+
+    // node 0: edge to 1 weighted 5, then edge to 2 with the default weight 1
+    try expectEqual(2, g.adj[0].items.len);
+    try expectEqual(1, g.adj[0].items[0].to);
+    try expectEqual(5, g.adj[0].items[0].w);
+    try expectEqual(2, g.adj[0].items[1].to);
+    try expectEqual(1, g.adj[0].items[1].w); // omitted weight -> 1
+
+    // node 2: edge to 3 weighted 7 (the blank line above was skipped)
+    try expectEqual(1, g.adj[2].items.len);
+    try expectEqual(3, g.adj[2].items[0].to);
+    try expectEqual(7, g.adj[2].items[0].w);
+
+    // nodes 1 and 3 have no outgoing edges
+    try expectEqual(0, g.adj[1].items.len);
+    try expectEqual(0, g.adj[3].items.len);
+}
+
+test "graph: parse rejects an edge referencing an out-of-range node" {
+    const a = testing.allocator;
+    const text =
+        \\2
+        \\0 5
+    ;
+    try expectError(error.NodeOutOfRange, parseGraph(a, text));
 }
