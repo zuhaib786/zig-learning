@@ -1,5 +1,6 @@
 const std = @import("std");
 const freq = @import("freq.zig");
+const graphlib = @import("graph.zig");
 const Io = std.Io;
 
 const CliError = error{
@@ -24,7 +25,23 @@ const Command = enum {
     cat,
     copy,
     freq,
+    graph,
 };
+
+const GraphAlgo = enum {
+    bfs,
+    dfs,
+    topo,
+    dijikstra,
+};
+
+fn parseAlgo(algo_string: []const u8) ?GraphAlgo {
+    if (std.mem.eql(u8, algo_string, "bfs")) return .bfs;
+    if (std.mem.eql(u8, algo_string, "dfs")) return .dfs;
+    if (std.mem.eql(u8, algo_string, "topo")) return .topo;
+    if (std.mem.eql(u8, algo_string, "dijikstra")) return .dijikstra;
+    return null;
+}
 
 const Counter = struct {
     count: TextCount = .{},
@@ -70,6 +87,7 @@ pub fn parseCommand(command_str: []const u8) ?Command {
     if (std.mem.eql(u8, command_str, "cat")) return .cat;
     if (std.mem.eql(u8, command_str, "copy")) return .copy;
     if (std.mem.eql(u8, command_str, "freq")) return .freq;
+    if (std.mem.eql(u8, command_str, "graph")) return .graph;
     return null;
 }
 
@@ -189,6 +207,36 @@ pub fn handle_freq(args: *std.process.Args.Iterator, out: *std.Io.Writer, in: *s
     return true;
 }
 
+pub fn handle_graph(args: *std.process.Args.Iterator, out: *std.Io.Writer, err: *std.Io.Writer, io: std.Io, gpa: std.mem.Allocator) !bool {
+    const algo_string = args.next() orelse {
+        try err.print("Please provide which algorithm to run\n", .{});
+        return false;
+    };
+    const algo = parseAlgo(algo_string) orelse {
+        try err.print("Unknown algo\n", .{});
+        return false;
+    };
+    const filename = args.next() orelse {
+        try err.print("Source file path not provided\n", .{});
+        return false;
+    };
+    const file = std.Io.Dir.cwd().openFile(io, filename, .{}) catch |e| printOpenError(e, filename, e);
+    defer file.close(io);
+    var buf: [4098]u8 = undefined;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var filereader = file.reader(io, &buf);
+    const reader = &filereader.interface;
+    const text = try reader.allocRemaining(arena, .unlimited);
+    var graph = try graphlib.parseGraph(allocator, text);
+    switch (algo) {
+        .bfs => performBfs(&graph, out, err, io),
+        .dfs => performDfs(&graph, out, err, io),
+        .dijikstra => performDijikstra(&graph, out, err, io),
+        .topo => performTopo(&graph, out, err, io),
+    }
+}
 pub fn countArgs(args: []const []const u8) CountResult {
     var count_result: CountResult = .{ .args = 0, .bytes = 0 };
     for (args) |arg| {
@@ -234,6 +282,7 @@ pub fn main(init: std.process.Init) !void {
         .cat => try handle_cat(&args, stdout, stderr, io),
         .copy => try handle_copy(&args, stdout, stderr, io),
         .freq => try handle_freq(&args, stdout, stdin, io, init.gpa),
+        .graph => try handle_graph(&args, stdout, stderr, io, init.gpa),
     };
     if (!ok) {
         // process.exit() skips the deferred flushes above, so flush by hand first.

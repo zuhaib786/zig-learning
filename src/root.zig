@@ -10,6 +10,9 @@ pub const queue = @import("queue.zig");
 pub const lru = @import("lru.zig");
 pub const sort = @import("sort.zig");
 pub const bst = @import("bst.zig");
+pub const treap = @import("treap.zig");
+pub const graph = @import("graph.zig");
+pub const heap = @import("heap.zig");
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
