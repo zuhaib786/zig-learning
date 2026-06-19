@@ -3,6 +3,7 @@ const freq = @import("freq.zig");
 const graphlib = @import("graph.zig");
 const walk = @import("walk.zig");
 const sum = @import("sum.zig");
+const concurrency = @import("concurrency.zig");
 const Io = std.Io;
 
 const CliError = error{
@@ -317,10 +318,25 @@ pub fn handle_walk(args: *std.process.Args.Iterator, out: *std.Io.Writer, err: *
     try walk.walk(gpa, io, dir, path, out, err);
     return true;
 }
-pub fn handle_sum(args: *std.process.Args.Iterator, out: *std.Io.Writer, err: *std.Io.Writer, in: *std.Io.Reader, io: std.Io) !bool {
+pub fn handle_sum(args: *std.process.Args.Iterator, out: *std.Io.Writer, err: *std.Io.Writer, in: *std.Io.Reader, io: std.Io, gpa: std.mem.Allocator) !bool {
     var i: usize = 0;
     var failed = false;
     while (args.next()) |path| : (i += 1) {
+        // `sum --parallel <dir>`: checksum every file under <dir> across a worker pool.
+        if (i == 0 and std.mem.eql(u8, path, "--parallel")) {
+            const root = args.next() orelse {
+                try err.print("--parallel needs a directory\n", .{});
+                return false;
+            };
+            const dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |e| {
+                try printOpenError(err, root, e);
+                return false;
+            };
+            var pdir = dir;
+            defer pdir.close(io);
+            try concurrency.parallelSum(gpa, io, pdir, root, out, err);
+            return true;
+        }
         var buffer: [4096]u8 = undefined;
         const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |e| {
             try printOpenError(err, path, e);
@@ -378,7 +394,7 @@ pub fn main(init: std.process.Init) !void {
         .freq => try handle_freq(&args, stdout, stdin, io, init.gpa),
         .graph => try handle_graph(&args, stdout, stderr, io, init.gpa),
         .walk => try handle_walk(&args, stdout, stderr, io, init.gpa),
-        .sum => try handle_sum(&args, stdout, stderr, stdin, io),
+        .sum => try handle_sum(&args, stdout, stderr, stdin, io, init.gpa),
     };
     if (!ok) {
         // process.exit() skips the deferred flushes above, so flush by hand first.

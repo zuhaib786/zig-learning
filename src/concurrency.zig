@@ -1,6 +1,7 @@
 const std = @import("std");
 const Mutex = std.Io.Mutex;
 const Allocator = std.mem.Allocator;
+const sum = @import("sum.zig");
 
 const Counter = struct {
     value: u64 = 0,
@@ -12,6 +13,15 @@ const Counter = struct {
             self.value += 1;
         }
     }
+};
+
+const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+
+// One result slot per file. The digest is a fixed-size array, so there is no
+// per-result allocation — nothing to leak, and each job owns its slot outright.
+const SumResult = struct {
+    digest: [digest_len]u8 = undefined,
+    err: ?anyerror = null,
 };
 
 const AtomicCounter = struct {
@@ -63,6 +73,102 @@ pub fn BlockingQueue(comptime T: type, comptime capacity: usize) type {
         }
     };
 }
+
+// A unit of work for the pool: hash one file and write the outcome into `result`.
+// `path` is borrowed (owned by the caller's path list) and outlives the job.
+// A per-file failure (can't open, read error) is recorded in the slot and the job
+// returns normally — it is NOT propagated to the pool's `first_error`, which is
+// reserved for unexpected job failures. A bad file must not abort the batch.
+const ChecksumJob = struct {
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    result: *SumResult,
+
+    pub fn run(self: ChecksumJob) anyerror!void {
+        const file = self.dir.openFile(self.io, self.path, .{}) catch |e| {
+            self.result.err = e;
+            return;
+        };
+        defer file.close(self.io);
+        var buf: [4096]u8 = undefined;
+        var file_reader = file.reader(self.io, &buf);
+        self.result.digest = sum.hashReaders(&file_reader.interface) catch |e| {
+            self.result.err = e;
+            return;
+        };
+    }
+};
+
+// Depth-first collection of every regular file's path (relative to the walk root)
+// into `out`. Each appended path is heap-owned by the caller. Mirrors walk.zig's
+// traversal but collects instead of printing so the pipeline can index the results.
+fn collectFiles(allocator: Allocator, io: std.Io, dir: std.Io.Dir, prefix: []const u8, out: *std.ArrayList([]u8)) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        switch (entry.kind) {
+            .file => {
+                const p = try std.fs.path.join(allocator, &.{ prefix, entry.name });
+                errdefer allocator.free(p);
+                try out.append(allocator, p);
+            },
+            .directory => {
+                const child_path = try std.fs.path.join(allocator, &.{ prefix, entry.name });
+                defer allocator.free(child_path);
+                var child = dir.openDir(io, entry.name, .{ .iterate = true }) catch |e| switch (e) {
+                    error.AccessDenied => continue,
+                    else => return e,
+                };
+                defer child.close(io);
+                try collectFiles(allocator, io, child, child_path, out);
+            },
+            else => {},
+        }
+    }
+}
+
+// Parallel file-checksum pipeline (Sprint 6 capstone deliverable). Walks `root`,
+// hashes every file across a worker pool, then prints `<hex>  <path>` in stable
+// collection order — NOT completion order. Per-file errors go to `err`; the batch
+// never aborts. This is "parallel map" expressed through the worker pool.
+pub fn parallelSum(allocator: Allocator, io: std.Io, dir: std.Io.Dir, root: []const u8, out: *std.Io.Writer, err: *std.Io.Writer) !void {
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| allocator.free(p);
+        paths.deinit(allocator);
+    }
+    try collectFiles(allocator, io, dir, root, &paths);
+    if (paths.items.len == 0) return;
+
+    // One slot per file, indexed by collection order. Jobs write to disjoint slots,
+    // so results need NO mutex: the only synchronization is the join in shutdown,
+    // which happens-before we read the slots back below.
+    const results = try allocator.alloc(SumResult, paths.items.len);
+    defer allocator.free(results);
+    for (results) |*r| r.* = .{};
+
+    const cpus = std.Thread.getCpuCount() catch 4;
+    const workers = @max(1, @min(cpus, paths.items.len));
+
+    // Collected paths are root-prefixed, i.e. relative to the cwd the caller opened
+    // `root` from — so jobs open against cwd, not the (already-root) iterate dir.
+    const open_base = std.Io.Dir.cwd();
+    var pool: Pool(ChecksumJob) = .{};
+    try pool.start(workers, io, allocator);
+    for (paths.items, results) |p, *r| {
+        pool.submit(.{ .dir = open_base, .io = io, .path = p, .result = r }, io);
+    }
+    try pool.shutdown(io, allocator); // joins every worker before we touch `results`
+
+    for (paths.items, results) |p, r| {
+        if (r.err) |e| {
+            try err.print("{s}: {s}\n", .{ p, @errorName(e) });
+        } else {
+            try out.print("{s}  {s}\n", .{ std.fmt.bytesToHex(r.digest, .lower), p });
+        }
+    }
+}
+
 pub fn Pool(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -95,6 +201,9 @@ pub fn Pool(comptime T: type) type {
             }
             var filled: usize = 0;
             errdefer {
+                // Workers already spawned are blocked in queue.pop; we must close
+                // the queue before joining or this error path deadlocks.
+                self.queue.close(io);
                 for (self.threads[0..filled]) |thread| {
                     thread.join();
                 }
@@ -122,6 +231,7 @@ pub fn Pool(comptime T: type) type {
         }
     };
 }
+
 test "test counter" {
     const io = std.testing.io;
     var counter: Counter = .{};
@@ -163,8 +273,8 @@ fn produceOnes(q: *TQ, io: std.Io, m: usize) void {
     for (0..m) |_| q.push(io, 1);
 }
 
-fn consumeSum(q: *TQ, io: std.Io, k: usize, sum: *std.atomic.Value(u64)) void {
-    for (0..k) |_| _ = sum.fetchAdd(q.pop(io).?, .monotonic); // never closed here ⇒ pop is non-null
+fn consumeSum(q: *TQ, io: std.Io, k: usize, total: *std.atomic.Value(u64)) void {
+    for (0..k) |_| _ = total.fetchAdd(q.pop(io).?, .monotonic); // never closed here ⇒ pop is non-null
 }
 
 fn consumeExpectOrder(q: *TQ, io: std.Io, n: usize, ok: *std.atomic.Value(bool)) void {
@@ -176,7 +286,7 @@ fn consumeExpectOrder(q: *TQ, io: std.Io, n: usize, ok: *std.atomic.Value(bool))
 test "blocking queue: producers and consumers all balance out" {
     const io = std.testing.io;
     var queue: TQ = .{ .mutex = .init };
-    var sum: std.atomic.Value(u64) = .init(0);
+    var total: std.atomic.Value(u64) = .init(0);
 
     const producers = 4;
     const consumers = 4;
@@ -189,14 +299,14 @@ test "blocking queue: producers and consumers all balance out" {
     var cthreads: [consumers]std.Thread = undefined;
 
     // start consumers first: they block on `not_empty` until producers feed the queue.
-    for (&cthreads) |*t| t.* = try std.Thread.spawn(.{}, consumeSum, .{ &queue, io, per_consumer, &sum });
+    for (&cthreads) |*t| t.* = try std.Thread.spawn(.{}, consumeSum, .{ &queue, io, per_consumer, &total });
     for (&pthreads) |*t| t.* = try std.Thread.spawn(.{}, produceOnes, .{ &queue, io, per_producer });
 
     for (pthreads) |t| t.join();
     for (cthreads) |t| t.join();
 
     // every "1" pushed was popped exactly once → the sum is the total item count.
-    try std.testing.expectEqual(@as(u64, producers * per_producer), sum.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, producers * per_producer), total.load(.monotonic));
 }
 
 test "blocking queue: single producer/consumer preserves FIFO order" {
@@ -264,4 +374,49 @@ test "pool: shuts down cleanly with no jobs (idle workers must wake and exit)" {
     var pool: Pool(TestJob) = .{};
     try pool.start(4, io, allocator);
     try pool.shutdown(io, allocator);
+}
+
+// --- parallel checksum pipeline test ---
+test "parallel sum: every file's digest matches serial hashReaders" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    // Build a small tree on disk (with a subdir, to exercise recursion).
+    const root = "zig-cache-psum-test";
+    var cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, root) catch {};
+    try cwd.createDirPath(io, root);
+    defer cwd.deleteTree(io, root) catch {};
+    try cwd.createDirPath(io, root ++ "/sub");
+
+    const files = [_]struct { path: []const u8, data: []const u8 }{
+        .{ .path = root ++ "/a.txt", .data = "abc" },
+        .{ .path = root ++ "/b.txt", .data = "hello world" },
+        .{ .path = root ++ "/sub/c.txt", .data = "" }, // empty file
+        .{ .path = root ++ "/sub/d.txt", .data = "the quick brown fox jumps over the lazy dog" },
+    };
+    for (files) |f| try cwd.writeFile(io, .{ .sub_path = f.path, .data = f.data });
+
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [1024]u8 = undefined;
+    var out_w = std.Io.Writer.fixed(&out_buf);
+    var err_w = std.Io.Writer.fixed(&err_buf);
+
+    var dir = try cwd.openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    try parallelSum(allocator, io, dir, root, &out_w, &err_w);
+
+    const out = out_w.buffered();
+    try std.testing.expectEqualStrings("", err_w.buffered()); // no per-file errors
+
+    // Output order is collection order (not completion order), so for each file we
+    // assert its expected `<hex>  <path>` line appears — independent of which line.
+    for (files) |f| {
+        var reader = std.Io.Reader.fixed(f.data);
+        const digest = try sum.hashReaders(&reader); // the serial reference
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        var line_buf: [256]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "{s}  {s}\n", .{ hex, f.path });
+        try std.testing.expect(std.mem.indexOf(u8, out, line) != null);
+    }
 }
