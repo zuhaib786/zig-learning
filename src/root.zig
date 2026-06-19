@@ -13,6 +13,10 @@ pub const bst = @import("bst.zig");
 pub const treap = @import("treap.zig");
 pub const graph = @import("graph.zig");
 pub const heap = @import("heap.zig");
+pub const walk = @import("walk.zig");
+pub const sum = @import("sum.zig");
+pub const binformat = @import("binformat.zig");
+pub const concurrency = @import("concurrency.zig");
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///

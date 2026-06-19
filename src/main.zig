@@ -1,6 +1,8 @@
 const std = @import("std");
 const freq = @import("freq.zig");
 const graphlib = @import("graph.zig");
+const walk = @import("walk.zig");
+const sum = @import("sum.zig");
 const Io = std.Io;
 
 const CliError = error{
@@ -26,6 +28,8 @@ const Command = enum {
     copy,
     freq,
     graph,
+    walk,
+    sum,
 };
 
 const GraphAlgo = enum {
@@ -88,6 +92,8 @@ pub fn parseCommand(command_str: []const u8) ?Command {
     if (std.mem.eql(u8, command_str, "copy")) return .copy;
     if (std.mem.eql(u8, command_str, "freq")) return .freq;
     if (std.mem.eql(u8, command_str, "graph")) return .graph;
+    if (std.mem.eql(u8, command_str, "walk")) return .walk;
+    if (std.mem.eql(u8, command_str, "sum")) return .sum;
     return null;
 }
 
@@ -299,7 +305,40 @@ pub fn countArgs(args: []const []const u8) CountResult {
     }
     return count_result;
 }
-
+pub fn handle_walk(args: *std.process.Args.Iterator, out: *std.Io.Writer, err: *std.Io.Writer, io: std.Io, gpa: std.mem.Allocator) !bool {
+    const path = args.next() orelse {
+        try err.print("You need to provide the path of iteration\n", .{});
+        return false;
+    };
+    const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |e| {
+        try printOpenError(err, path, e);
+        return false;
+    };
+    try walk.walk(gpa, io, dir, path, out, err);
+    return true;
+}
+pub fn handle_sum(args: *std.process.Args.Iterator, out: *std.Io.Writer, err: *std.Io.Writer, in: *std.Io.Reader, io: std.Io) !bool {
+    var i: usize = 0;
+    var failed = false;
+    while (args.next()) |path| : (i += 1) {
+        var buffer: [4096]u8 = undefined;
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |e| {
+            try printOpenError(err, path, e);
+            failed = true;
+            continue;
+        };
+        defer file.close(io);
+        var file_reader = file.reader(io, &buffer);
+        const reader = &file_reader.interface;
+        const bytes = try sum.hashReaders(reader);
+        try out.print("{s} {s}\n", .{ std.fmt.bytesToHex(bytes, .lower), path });
+    }
+    if (i == 0) {
+        const bytes = try sum.hashReaders(in);
+        try out.print("{s} stdin\n", .{std.fmt.bytesToHex(bytes, .lower)});
+    }
+    return !failed;
+}
 pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
     const io = init.io;
@@ -319,7 +358,7 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next(); // Skip what is at start
     const usage: []const u8 =
         \\usage: lzig <command> [args]
-        \\commands: echo count cat copy freq
+        \\commands: echo count cat copy freq walk
         \\
     ;
     const command_name: []const u8 = args.next() orelse {
@@ -338,6 +377,8 @@ pub fn main(init: std.process.Init) !void {
         .copy => try handle_copy(&args, stdout, stderr, io),
         .freq => try handle_freq(&args, stdout, stdin, io, init.gpa),
         .graph => try handle_graph(&args, stdout, stderr, io, init.gpa),
+        .walk => try handle_walk(&args, stdout, stderr, io, init.gpa),
+        .sum => try handle_sum(&args, stdout, stderr, stdin, io),
     };
     if (!ok) {
         // process.exit() skips the deferred flushes above, so flush by hand first.
